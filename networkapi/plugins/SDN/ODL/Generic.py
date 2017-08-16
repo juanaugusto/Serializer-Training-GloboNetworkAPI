@@ -22,6 +22,8 @@ import requests
 from requests.auth import HTTPBasicAuth
 from requests.exceptions import HTTPError
 
+from django.core.exceptions import ObjectDoesNotExist
+
 from networkapi.plugins import exceptions
 from networkapi.plugins.SDN.base import BaseSdnPlugin
 from networkapi.equipamento.models import EquipamentoAcesso
@@ -55,56 +57,68 @@ class ODLPlugin(BaseSdnPlugin):
             # If AttributeError raised, equipment_access do not exists
             self.equipment_access = self._get_equipment_access()
 
-    def get_flows(self):
-        """
-        :return: All flows for table 0
-        """
-        nodes_ids = self._get_nodes_ids()
-
-        flows_list_by_switch = []
-        for node_id in nodes_ids:
-            path = "/restconf/config/opendaylight-inventory:nodes/node/%s/flow-node-inventory:table/0/"\
-                   % (node_id)
-
-            flows_list_by_switch.append(
-                self._request(method="get", path=path, contentType='json')
-            )
-
-        return flows_list_by_switch
-
     def add_flow(self, data=None, flow_id=0, flow_type=FlowTypes.ACL):
 
         if flow_type == FlowTypes.ACL:
             builder = AclFlowBuilder(data)
 
-        builder.build()
-        return_flows = []
+            flows_set = builder.build()
 
-        for flow in builder.flows:
-            flow_id = flow['flow']['id']
-            data_to_send = json.dumps(flow)
+            for flows in flows_set:
+                for flow in flows['flow']:
 
-            return_flows.append(
-                self._flow(flow_id=flow_id, method='put', data=data_to_send)
-            )
+                    self._flow(flow_id=flow['id'],
+                               method='put',
+                               data=json.dumps({'flow': [flow]}))
 
-        return return_flows
+        return None
 
     def del_flow(self, flow_id=0):
         return self._flow(flow_id=flow_id, method='delete')
+
+    def flush_flows(self):
+        nodes_ids = self._get_nodes_ids()
+        if len(nodes_ids) < 1:
+            raise exceptions.ControllerInventoryIsEmpty(msg="No nodes found")
+
+        for node_id in nodes_ids:
+            try:
+                path = "/restconf/config/opendaylight-inventory:nodes/node/%s/flow-node-inventory:table/0/" \
+                       % node_id
+
+                self._request(
+                        method="delete", path=path, contentType='json'
+                    )
+            except HTTPError as e:
+                if e.response.status_code==404:
+                    pass
+                else:
+                    raise exceptions.CommandErrorException(msh=self._parse_errors(e.response.json()))
+            except Exception as e:
+                raise e
+
+    def _parse_errors(self, err_json):
+        sep = ""
+        msg = ""
+        for error in err_json["errors"]["error"]:
+            msg = msg + sep + error["error-message"]
+            sep = ". "
+        return msg
 
     def get_flow(self, flow_id=0):
         return self._flow(flow_id=flow_id, method='get')
 
     def _flow(self, flow_id=0, method='', data=None):
 
-        allowed_methods=["get", "put", "delete"]
+        allowed_methods = ["get", "put", "delete"]
 
         if flow_id < 1 or method not in allowed_methods:
             log.error("Invalid parameters in OLDPlugin flow handler")
             raise exceptions.ValueInvalid()
 
         nodes_ids = self._get_nodes_ids()
+        if len(nodes_ids)<1:
+            raise exceptions.ControllerInventoryIsEmpty(msg="No nodes found")
 
         return_flows = []
         for node_id in nodes_ids:
@@ -119,6 +133,32 @@ class ODLPlugin(BaseSdnPlugin):
 
         return return_flows
 
+    def get_flows(self):
+        """
+        :return: All flows for table 0
+        """
+        nodes_ids = self._get_nodes_ids()
+        if len(nodes_ids)<1:
+            raise exceptions.ControllerInventoryIsEmpty(msg="No nodes found")
+
+        flows_list_by_switch = {}
+        for node_id in nodes_ids:
+            try:
+                path = "/restconf/config/opendaylight-inventory:nodes/node/%s/flow-node-inventory:table/0/"\
+                       % (node_id)
+
+                flows_list_by_switch[node_id] = self._request(method="get", path=path, contentType='json')["flow-node-inventory:table"]
+
+            except HTTPError as e:
+                if e.response.status_code == 404:
+                    flows_list_by_switch[node_id] =[]
+                else:
+                    raise exceptions.CommandErrorException(msh=self._parse_errors(e.response.json()))
+            except Exception as e:
+                raise e
+
+
+        return flows_list_by_switch
     def _get_nodes_ids(self):
         """
         Returns a list of nodes ids controlled by ODL
@@ -130,12 +170,13 @@ class ODLPlugin(BaseSdnPlugin):
         return nodes_ids
 
     def _get_nodes(self):
-        path = "/restconf/operational/opendaylight-inventory:nodes/"
+        path = "/restconf/config/opendaylight-inventory:nodes/"
         nodes = self._request(method='get', path=path, contentType='json')
         retorno = []
-        for node in nodes['nodes']['node']:
-            if node["id"] not in ["controller-config"]:
-                retorno.append(node)
+        if nodes['nodes'].has_key('node'):
+            for node in nodes['nodes']['node']:
+                if node["id"] not in ["controller-config"]:
+                    retorno.append(node)
         return retorno
 
     def _request(self, **kwargs):
@@ -159,9 +200,10 @@ class ODLPlugin(BaseSdnPlugin):
         headers = self._get_headers(contentType=params["contentType"])
         uri = self._get_uri(path=params["path"])
 
-        log.info("Starting %s request to controller %s at %s. Data to be sent: %s" %
+        log.debug(
+            "Starting %s request to controller %s at %s. Data to be sent: %s" %
             (params["method"], self.equipment.nome, uri, params["data"])
-         )
+        )
 
         try:
             # Raises AttributeError if method is not valid
@@ -184,15 +226,16 @@ class ODLPlugin(BaseSdnPlugin):
         except AttributeError:
             log.error('Request method must be valid HTTP request. '
                       'ie: GET, POST, PUT, DELETE')
-        except HTTPError:
-            try:
-                response = json.loads(request.text)
-                for error in response["errors"]["error"]:
-                    log.error(error["error-message"])
-            except:
-                log.error("Unknown error during request to ODL Controller")
-
-            raise HTTPError(request.status_code)
+        # except HTTPError as e:
+        #
+        #     try:
+        #         response = json.loads(request.text)
+        #         for error in response["errors"]["error"]:
+        #             log.error(error["error-message"])
+        #     except:
+        #         log.error("Unknown error during request to ODL Controller")
+        #
+        #     raise HTTPError("Error during request to ODL Controller. Code %s" % request.status_code)
 
     def _get_auth(self):
         return self._basic_auth()
@@ -218,10 +261,18 @@ class ODLPlugin(BaseSdnPlugin):
 
     def _get_equipment_access(self):
         try:
-            return EquipamentoAcesso.search(
-                None, self.equipment, 'https').uniqueResult()
+
+            access = None
+            try:
+                access = EquipamentoAcesso.search(
+                    None, self.equipment, 'https').uniqueResult()
+            except ObjectDoesNotExist:
+                access = EquipamentoAcesso.search(
+                    None, self.equipment, 'http').uniqueResult()
+            return access
+
         except Exception:
+
             log.error('Access type %s not found for equipment %s.' %
                       ('https', self.equipment.nome))
             raise exceptions.InvalidEquipmentAccessException()
-        # TODO: ver o metodo existente, bater com o host (http com http)

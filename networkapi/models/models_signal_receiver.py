@@ -21,6 +21,8 @@ from django.utils.translation import ugettext_lazy as _
 
 from networkapi.eventlog.models import AuditRequest
 from networkapi.eventlog.models import EventLog
+from networkapi.eventlog.models import EventLogQueue
+from networkapi.settings import LOG_QUEUE
 from networkapi.util import signals_helper as m2m_audit
 
 MODEL_LIST = set()
@@ -181,8 +183,8 @@ def save_audit(instance, operation, kwargs={}):
         if persist_audit:
             if m2m_change:
                 for description in descriptions:
-                    obj_description = (
-                        instance and unicode(instance) and '')[:100]
+                    # obj_description = (
+                    #     instance and unicode(instance) and '')[:100]
                     audit_request = AuditRequest.current_request(True)
 
                     changed_field = changed_fields.pop(0)
@@ -203,11 +205,15 @@ def save_audit(instance, operation, kwargs={}):
                     # save the event log
                     if audit_request:
                         EventLog.log(audit_request.user, event)
+                        if LOG_QUEUE:
+                            EventLogQueue.log(audit_request.user, event)
                     else:
                         EventLog.log(None, event)
+                        if LOG_QUEUE:
+                            EventLogQueue.log(None, event)
 
             else:
-                obj_description = (instance and unicode(instance) and '')[:100]
+                # obj_description = (instance and unicode(instance) and '')[:100]
                 audit_request = AuditRequest.current_request(True)
 
                 old_value_list = []
@@ -226,8 +232,12 @@ def save_audit(instance, operation, kwargs={}):
                 event['audit_request'] = audit_request
                 if audit_request:
                     EventLog.log(audit_request.user, event)
+                    if LOG_QUEUE:
+                        EventLogQueue.log(audit_request.user, event)
                 else:
                     EventLog.log(None, event)
+                    if LOG_QUEUE:
+                        EventLogQueue.log(None, event)
     except:
         LOG.error(u'Error registering auditing to %s: (%s) %s',
                   repr(instance), type(instance), getattr(instance, '__dict__', None), exc_info=True)
